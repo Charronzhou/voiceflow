@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#143f38">
+  <title>VoiceFlow · 让表达自然留下来</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <header><div class="topbar">
+    <a class="brand" href="/" aria-label="VoiceFlow 首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>VoiceFlow</a>
+    <button id="settings-open" class="settings-button" type="button">名单与设置</button>
+  </div></header>
+  <main>
+    <div class="heading"><h1>把想说的，说下来。</h1><p>录一段音，或上传文件。整理后的文字，依然是你的语气。</p></div>
+    <div class="workspace">
+      <section class="input-card" aria-labelledby="input-title">
+        <div class="card-heading"><h2 id="input-title">开始一段录音</h2><span id="timer" class="timer">00:00</span></div>
+        <div class="record-area">
+          <div id="wave" class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <button id="record" class="record-button" type="button"><span class="record-dot"></span><span id="record-label">开始录音</span></button>
+          <p class="secondary">最长 2 分钟，点击停止后自动整理</p>
+        </div>
+        <div class="or"><span>或上传已有录音</span></div>
+        <label class="upload" id="drop-zone">
+          <input id="file" type="file" accept=".aac,.aiff,.flac,.m4a,.mp3,.mp4,.oga,.ogg,.opus,.wav,.webm,audio/*">
+          <span class="upload-icon" aria-hidden="true">＋</span><strong>选择录音文件</strong>
+          <span>支持 MP3、M4A、WAV、WebM 等 · 最大 20 MB</span>
+        </label>
+        <div class="selected" id="selected" hidden><span id="filename"></span><audio id="preview" controls></audio></div>
+        <div class="privacy">
+          <label class="check"><input id="save-enabled" type="checkbox"><span>在此设备保存名单和复制记录</span></label>
+          <p>开启后会在本机保存名单，以及复制时的原始转写、模型输出和手改版本；录音会经服务器发送到 AI Builder Space 处理。</p>
+          <p id="storage-note" class="secondary">当前关闭保存，内容仅保留在本次页面中。</p>
+        </div>
+      </section>
+      <section class="output-card" aria-labelledby="output-title">
+        <div class="card-heading"><div><h2 id="output-title">整理结果</h2><p class="secondary">可以直接修改，再复制使用。</p></div><button id="copy" class="copy-button" disabled type="button">复制文字</button></div>
+        <div id="status" class="status" role="status" aria-live="polite">等待你的第一段录音</div>
+        <textarea id="output" aria-label="可编辑的整理结果" placeholder="整理好的文字会显示在这里…" spellcheck="false"></textarea>
+        <div class="output-bottom"><span id="word-count">0 字符</span><span id="copy-status" role="status"></span></div>
+        <details id="raw-details" hidden><summary>查看原始转写</summary><p id="raw-text" class="raw-text"></p></details>
+      </section>
+    </div>
+    <details class="history" id="history" hidden><summary id="history-summary">本机复制记录</summary><div id="history-list"></div></details>
+    <footer>VoiceFlow <span>保留原意，也保留你的表达方式。</span></footer>
+  </main>
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <div class="dialog-heading"><h2>名单与术语</h2><button value="cancel" aria-label="关闭设置" type="submit" formnovalidate>×</button></div>
+      <p>填写你经常提到的人名和术语，帮助识别和纠错。每行一项，可以补充角色或写法说明。</p>
+      <label for="names">你的名单</label>
+      <textarea id="names" placeholder="人名：角色或其他说明&#10;术语：正确写法" maxlength="20000"></textarea>
+      <p class="secondary">名单随每次录音提交给识别和纠错接口；开启本机保存后，刷新页面仍可使用。</p>
+      <div class="dialog-actions"><button id="clear" type="button" class="plain">清空本机记录</button><button id="settings-save" type="button" class="primary">使用这份名单</button></div>
+      <p id="settings-status" role="status"></p>
+    </form>
+  </dialog>
+</body>
+</html>
