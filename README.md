@@ -31,4 +31,6 @@ npm test
 
 The Dockerfile runs one Node server on the runtime `PORT` (default 8000). Static files and API routes share that server. Publish this source-only project to a public Git repository, then deploy that repository with the platform deployment API. The injected token belongs in the server environment, never in the repository or browser code. Any local environment files, recordings, personal lists, evaluation corpora and operational logs are excluded from the project.
 
+Set `PUBLIC_ORIGIN` to the deployed HTTPS origin, such as `https://voiceflow.ai-builders.space`, without a path. This keeps browser uploads working when the reverse proxy rewrites the internal Host header, while rejecting requests from other origins. Leave it unset for direct localhost use.
+
 Repository publication and deployment should happen only after its owner has reviewed the complete file list.

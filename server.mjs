@@ -96,17 +96,29 @@ async function readBody(request) {
   return Buffer.concat(chunks);
 }
 
-function sameOrigin(request) {
+function sameOrigin(request, publicOrigin) {
   const origin = request.headers.origin;
   if (!origin) return true;
   try {
-    return new URL(origin).host === request.headers.host;
+    const protocol = request.socket.encrypted ? "https" : "http";
+    const expected = publicOrigin || `${protocol}://${request.headers.host}`;
+    return new URL(origin).origin === origin && origin === expected;
   } catch {
     return false;
   }
 }
 
-export async function createApp({ token = process.env.AI_BUILDER_TOKEN, fetcher = fetch } = {}) {
+export async function createApp({
+  token = process.env.AI_BUILDER_TOKEN, fetcher = fetch, publicOrigin = process.env.PUBLIC_ORIGIN,
+} = {}) {
+  if (publicOrigin) {
+    const configured = new URL(publicOrigin);
+    if (!["https:", "http:"].includes(configured.protocol) || configured.username || configured.password
+      || configured.pathname !== "/" || configured.search || configured.hash) {
+      throw new Error("PUBLIC_ORIGIN must be an HTTP or HTTPS origin.");
+    }
+    publicOrigin = configured.origin;
+  }
   const rules = await readFile(resolve(ROOT, "skills/cleanup.md"), "utf8");
   const contents = Object.fromEntries(await Promise.all(
     Object.entries(assets).map(async ([url, [path, type]]) => [url, { body: await readFile(resolve(ROOT, path)), type }]),
@@ -133,7 +145,7 @@ export async function createApp({ token = process.env.AI_BUILDER_TOKEN, fetcher 
         return response.end(contents[path].body);
       }
       if (request.method !== "POST" || path !== "/api/process") return json(404, { error: "页面不存在。" });
-      if (!sameOrigin(request)) throw new AppError(403, "请从 VoiceFlow 页面提交录音。");
+      if (!sameOrigin(request, publicOrigin)) throw new AppError(403, "请从 VoiceFlow 页面提交录音。");
       const ip = request.headers["x-forwarded-for"]?.split(",")[0].trim() || request.socket.remoteAddress;
       const now = Date.now();
       for (const [key, value] of recent) if (value.reset < now) recent.delete(key);

@@ -75,6 +75,43 @@ test("HTTP surface exposes only static assets and safe processing results", asyn
     method: "POST", body: new FormData(), headers: { Origin: "https://unrelated.example" },
   });
   assert.equal(blocked.status, 403);
+  const wrongProtocol = await fetch(base + "/api/process", {
+    method: "POST", body: new FormData(), headers: { Origin: base.replace("http:", "https:") },
+  });
+  assert.equal(wrongProtocol.status, 403);
+});
+
+test("configured public origin survives proxy host rewriting and rejects forwarded origin spoofing", async t => {
+  const calls = [];
+  const publicOrigin = "https://voiceflow.ai-builders.space";
+  const server = await createApp({ token, fetcher: mockProvider(calls), publicOrigin });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = "http://127.0.0.1:" + server.address().port;
+  const form = new FormData();
+  form.append("audio", audio());
+  const response = await fetch(base + "/api/process", {
+    method: "POST", body: form,
+    headers: { Origin: publicOrigin, Host: "voiceflow.internal:8000" },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).original, "今天的事情定了。");
+  assert.equal(calls.length, 2);
+  for (const origin of ["https://unrelated.example", base, publicOrigin + "/path", "null"]) {
+    const blocked = await fetch(base + "/api/process", {
+      method: "POST", body: new FormData(),
+      headers: { Origin: origin, Host: "voiceflow.internal:8000", "X-Forwarded-Host": new URL(base).host },
+    });
+    assert.equal(blocked.status, 403);
+  }
+  assert.equal(calls.length, 2);
+});
+
+test("invalid public origin configuration fails before starting the server", async () => {
+  for (const publicOrigin of ["not-a-url", "https://user:secret@example.com", "https://example.com/path", "file:///tmp"]) {
+    await assert.rejects(createApp({ token, publicOrigin }));
+  }
 });
 
 test("browser recording start/stop uploads audio and releases the microphone", async () => {
