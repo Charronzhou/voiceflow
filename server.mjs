@@ -2,11 +2,14 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
+import { randomUUID, randomBytes } from "node:crypto";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const BASE = "https://space.ai-builders.com/backend/v1";
 const MAX_AUDIO = 20 * 1024 * 1024;
 const MAX_BODY = MAX_AUDIO + 128 * 1024;
+const CHUNK_SIZE = 512 * 1024;
+const UPLOAD_TTL = 5 * 60_000;
 const EXTENSIONS = new Set(["aac", "aiff", "flac", "m4a", "mp3", "mp4", "oga", "ogg", "opus", "wav", "webm"]);
 const assets = {
   "/": ["public/index.html", "text/html; charset=utf-8"],
@@ -84,13 +87,13 @@ export async function processAudio(audio, names, { token, fetcher = fetch, rules
   return { raw, original: cleaned.trim() };
 }
 
-async function readBody(request) {
-  if (Number(request.headers["content-length"]) > MAX_BODY) throw new AppError(413, "文件太大，最大支持 20 MB。");
+async function readBody(request, maximum = MAX_BODY) {
+  if (Number(request.headers["content-length"]) > maximum) throw new AppError(413, "上传内容过大，请重新选择录音。");
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > MAX_BODY) throw new AppError(413, "文件太大，最大支持 20 MB。");
+    if (size > maximum) throw new AppError(413, "上传内容过大，请重新选择录音。");
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
@@ -124,6 +127,12 @@ export async function createApp({
     Object.entries(assets).map(async ([url, [path, type]]) => [url, { body: await readFile(resolve(ROOT, path)), type }]),
   ));
   const recent = new Map();
+  const uploads = new Map();
+  const expireUploads = () => {
+    for (const [id, upload] of uploads) if (upload.expires < Date.now()) uploads.delete(id);
+  };
+  const expiryTimer = setInterval(expireUploads, 30_000);
+  expiryTimer.unref();
   let active = 0;
   const server = http.createServer(async (request, response) => {
     const headers = {
@@ -144,17 +153,97 @@ export async function createApp({
         response.writeHead(200, { ...headers, "Content-Type": contents[path].type });
         return response.end(contents[path].body);
       }
-      if (request.method !== "POST" || path !== "/api/process") return json(404, { error: "页面不存在。" });
+      const uploadRoute = /^\/api\/uploads\/([0-9a-f-]+)(?:\/(\d+|complete))?$/.exec(path);
+      const createUpload = request.method === "POST" && path === "/api/uploads";
+      const directUpload = request.method === "POST" && path === "/api/process";
+      const chunkUpload = request.method === "PUT" && uploadRoute?.[2] && uploadRoute[2] !== "complete";
+      const completeUpload = request.method === "POST" && uploadRoute?.[2] === "complete";
+      const deleteUpload = request.method === "DELETE" && uploadRoute && !uploadRoute[2];
+      if (!createUpload && !directUpload && !chunkUpload && !completeUpload && !deleteUpload) {
+        return json(404, { error: "页面不存在。" });
+      }
       if (!sameOrigin(request, publicOrigin)) throw new AppError(403, "请从 VoiceFlow 页面提交录音。");
+      expireUploads();
+      let upload;
+      if (uploadRoute) {
+        upload = uploads.get(uploadRoute[1]);
+        if (!upload || request.headers["x-upload-token"] !== upload.token) {
+          throw new AppError(404, "上传已过期，请重新选择录音。");
+        }
+        if (deleteUpload) {
+          uploads.delete(uploadRoute[1]);
+          return json(200, { deleted: true });
+        }
+        if (chunkUpload) {
+          const index = Number(uploadRoute[2]);
+          if (upload.receiving || index !== upload.chunks.length || index >= Math.ceil(upload.size / CHUNK_SIZE)) {
+            throw new AppError(409, "录音上传顺序有误，请重新上传。");
+          }
+          upload.receiving = true;
+          try {
+            const chunk = await readBody(request, CHUNK_SIZE);
+            const expected = Math.min(CHUNK_SIZE, upload.size - index * CHUNK_SIZE);
+            if (chunk.length !== expected || uploads.get(uploadRoute[1]) !== upload) {
+              throw new AppError(400, "录音上传不完整，请重新上传。");
+            }
+            upload.chunks.push(chunk);
+            upload.expires = Date.now() + UPLOAD_TTL;
+            return json(200, { received: index + 1 });
+          } catch (error) {
+            uploads.delete(uploadRoute[1]);
+            throw error;
+          } finally {
+            upload.receiving = false;
+          }
+        }
+        if (upload.receiving || upload.chunks.length !== Math.ceil(upload.size / CHUNK_SIZE)) {
+          throw new AppError(409, "录音上传不完整，请重新上传。");
+        }
+      }
       const ip = request.headers["x-forwarded-for"]?.split(",")[0].trim() || request.socket.remoteAddress;
       const now = Date.now();
       for (const [key, value] of recent) if (value.reset < now) recent.delete(key);
       const bucket = recent.get(ip) || { count: 0, reset: now + 60_000 };
-      if (bucket.count >= 8 || active >= 3) throw new AppError(429, "处理请求较多，请稍等片刻。");
-      bucket.count++;
-      recent.set(ip, bucket);
+      if (active >= 1 || ((createUpload || directUpload) && (bucket.count >= 8 || uploads.size >= 1))) {
+        throw new AppError(429, "正在处理另一段录音，请稍等片刻。");
+      }
+      if (createUpload || directUpload) {
+        bucket.count++;
+        recent.set(ip, bucket);
+      }
+      if (createUpload) {
+        if (!token) throw new AppError(503, "服务端尚未配置识别接口，请联系应用维护者。");
+        let metadata;
+        try {
+          metadata = JSON.parse((await readBody(request, 128 * 1024)).toString("utf8"));
+        } catch (error) {
+          if (error instanceof AppError) throw error;
+          throw new AppError(400, "录音信息格式无效。");
+        }
+        if (!metadata || typeof metadata !== "object" || !Number.isSafeInteger(metadata.size)
+          || metadata.size <= 0 || metadata.size > MAX_AUDIO
+          || typeof metadata.name !== "string" || metadata.name.length > 512
+          || !EXTENSIONS.has(metadata.name.split(".").pop().toLowerCase())
+          || typeof metadata.type !== "string" || metadata.type.length > 200
+          || typeof metadata.names !== "string" || metadata.names.length > 20_000) {
+          throw new AppError(400, "录音信息无效，文件最大支持 20 MB。");
+        }
+        // Recheck after reading the body so concurrent requests share one slot.
+        if (uploads.size || active) throw new AppError(429, "正在处理另一段录音，请稍等片刻。");
+        const id = randomUUID();
+        const uploadToken = randomBytes(32).toString("hex");
+        uploads.set(id, { ...metadata, token: uploadToken, chunks: [], receiving: false, expires: Date.now() + UPLOAD_TTL });
+        return json(201, { id, token: uploadToken, chunkSize: CHUNK_SIZE });
+      }
       active++;
       try {
+        if (completeUpload) {
+          uploads.delete(uploadRoute[1]);
+          const buffer = Buffer.concat(upload.chunks, upload.size);
+          upload.chunks = [];
+          const audio = new File([buffer], upload.name, { type: upload.type });
+          return json(200, await processAudio(audio, upload.names, { token, fetcher, rules }));
+        }
         if (!request.headers["content-type"]?.startsWith("multipart/form-data;")) {
           throw new AppError(400, "请选择录音文件。");
         }
@@ -179,6 +268,7 @@ export async function createApp({
     }
   });
   server.requestTimeout = 240_000;
+  server.on("close", () => clearInterval(expiryTimer));
   return server;
 }
 

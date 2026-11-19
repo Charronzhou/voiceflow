@@ -25,6 +25,7 @@ npm test
 - Local saving is off by default. When enabled, the browser saves the visitor's list and, on a successful Copy action, the raw transcription, original model output and edited result. Records are kept in IndexedDB on that device. The list is kept in localStorage. Saving the same edit of the same result again updates its record. Turning saving off clears saved records and the saved list. The current page's in-memory result remains editable.
 - Saved pairs survive browser refreshes. They are not synced between devices. Browser data removal also removes the saved records. Recent pairs are visible below the editor.
 - Recordings are limited to two minutes in the browser, and uploads to 20 MB. Processing time depends on audio duration and upstream response time. Requests time out with a retry message.
+- Files larger than 512 KiB are uploaded in 512 KiB chunks to fit the platform proxy's request limit. One temporary upload or processing job is accepted at a time for the 256 MB container. Chunks stay in server memory, are cleared when processing starts or an upload is canceled, and expire after five minutes of inactivity. A process restart loses unfinished uploads; retry by selecting the file again.
 - The public service uses in-memory request limits and a small concurrency cap. Server logs contain startup messages, not audio, names, text, or credentials.
 
 ## Deploy to AI Builder Space

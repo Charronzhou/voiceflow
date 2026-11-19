@@ -114,6 +114,92 @@ test("invalid public origin configuration fails before starting the server", asy
   }
 });
 
+test("chunked uploads are bounded, ordered, authorized and cleared after processing", async t => {
+  const calls = [];
+  const server = await createApp({ token, fetcher: mockProvider(calls) });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = "http://127.0.0.1:" + server.address().port;
+  const size = 1206560;
+  const metadata = { name: "synthetic.wav", size, type: "audio/wav", names };
+  const create = (data = metadata, origin = base) => fetch(base + "/api/uploads", {
+    method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify(data),
+  });
+  assert.equal((await create(metadata, "https://unrelated.example")).status, 403);
+  assert.equal((await create({ ...metadata, size: 20 * 1024 * 1024 + 1 })).status, 400);
+  const upload = await (await create()).json();
+  assert.equal(upload.chunkSize, 512 * 1024);
+  const path = base + "/api/uploads/" + upload.id;
+  const headers = { Origin: base, "X-Upload-Token": upload.token };
+  assert.equal((await create()).status, 429);
+  assert.equal((await fetch(path + "/0", { method: "PUT", body: "x" })).status, 404);
+  assert.equal((await fetch(path + "/complete", { method: "POST", headers })).status, 409);
+  const content = new Uint8Array(size).fill(42);
+  for (let offset = 0, index = 0; offset < size; offset += upload.chunkSize, index++) {
+    const body = content.slice(offset, offset + upload.chunkSize);
+    const options = { method: "PUT", headers, body };
+    assert.equal((await fetch(path + "/" + index, options)).status, 200);
+    if (index === 0) assert.equal((await fetch(path + "/0", options)).status, 409);
+  }
+  const result = await fetch(path + "/complete", { method: "POST", headers });
+  assert.equal(result.status, 200);
+  assert.equal((await result.json()).original, "今天的事情定了。");
+  assert.deepEqual(new Uint8Array(await calls[0].options.body.get("audio_file").arrayBuffer()), content);
+  assert.equal((await fetch(path + "/complete", { method: "POST", headers })).status, 404);
+
+  const maximum = await create({ ...metadata, size: 20 * 1024 * 1024 });
+  assert.equal(maximum.status, 201);
+  const reserved = await maximum.json();
+  const reservedPath = base + "/api/uploads/" + reserved.id;
+  const reservedHeaders = { Origin: base, "X-Upload-Token": reserved.token };
+  const oversized = await fetch(reservedPath + "/0", {
+    method: "PUT", headers: reservedHeaders, body: new Uint8Array(512 * 1024 + 1),
+  });
+  assert.equal(oversized.status, 413);
+  assert.equal((await fetch(reservedPath, { method: "DELETE", headers: reservedHeaders })).status, 404);
+  const again = await (await create()).json();
+  assert.equal((await fetch(base + "/api/uploads/" + again.id, {
+    method: "DELETE", headers: { Origin: base, "X-Upload-Token": again.token },
+  })).status, 200);
+
+  const expired = await (await create()).json();
+  const originalNow = Date.now;
+  Date.now = () => originalNow() + 5 * 60_000 + 1;
+  try {
+    assert.equal((await fetch(base + "/api/uploads/" + expired.id + "/0", {
+      method: "PUT", body: new Uint8Array(512 * 1024),
+      headers: { Origin: base, "X-Upload-Token": expired.token },
+    })).status, 404);
+  } finally {
+    Date.now = originalNow;
+  }
+  const failed = await (await create()).json();
+  const failedPath = base + "/api/uploads/" + failed.id;
+  const failedHeaders = { Origin: base, "X-Upload-Token": failed.token };
+  assert.equal((await fetch(failedPath + "/0", { method: "PUT", headers: failedHeaders, body: "too short" })).status, 400);
+  assert.equal((await fetch(failedPath, { method: "DELETE", headers: failedHeaders })).status, 404);
+});
+
+test("chunked completion releases the session when the speech provider fails", async t => {
+  const server = await createApp({ token, fetcher: async () => new Response("upstream failure", { status: 500 }) });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = "http://127.0.0.1:" + server.address().port;
+  const create = () => fetch(base + "/api/uploads", {
+    method: "POST", headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "test.wav", size: 3, type: "audio/wav", names: "" }),
+  });
+  const upload = await (await create()).json();
+  const path = base + "/api/uploads/" + upload.id;
+  const headers = { Origin: base, "X-Upload-Token": upload.token };
+  assert.equal((await fetch(path + "/0", { method: "PUT", headers, body: "abc" })).status, 200);
+  assert.equal((await fetch(path + "/complete", { method: "POST", headers })).status, 502);
+  assert.equal((await fetch(path + "/complete", { method: "POST", headers })).status, 404);
+  assert.equal((await create()).status, 201);
+});
+
 test("browser recording start/stop uploads audio and releases the microphone", async () => {
   const { readFile } = await import("node:fs/promises");
   const vm = await import("node:vm");
@@ -165,4 +251,41 @@ test("browser recording start/stop uploads audio and releases the microphone", a
   };
   await element("record").onclick();
   assert.equal(element("status").textContent, "麦克风权限未开启，可以上传已有录音。");
+
+  for (const [httpStatus, message] of [
+    [413, "上传被服务器限制，请选择更小的录音后重试。"],
+    [504, "语音服务响应超时或暂时不可用，请稍后重试。"],
+    [200, "服务器返回了无效响应（HTTP 200），请稍后重试。"],
+  ]) {
+    context.fetch = async () => new Response("<html><h1>upstream error</h1></html>", { status: httpStatus });
+    await element("file").onchange({ target: { files: [audio()], value: "sample.wav" } });
+    assert.equal(element("status").textContent, message);
+    assert.equal(element("copy").disabled, true);
+    assert.equal(element("file").disabled, false);
+  }
+
+  const chunkCalls = [];
+  context.fetch = async (url, options) => {
+    chunkCalls.push({ url, options });
+    if (url === "/api/uploads") return Response.json({ id: "test-upload", token: "test-upload-token", chunkSize: 512 * 1024 });
+    if (url.endsWith("/complete")) return Response.json({ raw: "原文", original: "分块上传结果" });
+    return Response.json({ received: 1 });
+  };
+  const larger = new File([new Uint8Array(1206560)], "large.wav", { type: "audio/wav" });
+  await element("file").onchange({ target: { files: [larger], value: "large.wav" } });
+  assert.equal(element("output").value, "分块上传结果");
+  assert.deepEqual(chunkCalls.map(call => call.options.method), ["POST", "PUT", "PUT", "PUT", "POST"]);
+  assert.deepEqual(chunkCalls.slice(1, 4).map(call => call.options.body.size), [524288, 524288, 157984]);
+  assert(chunkCalls.slice(1).every(call => call.options.headers["X-Upload-Token"] === "test-upload-token"));
+
+  const failedCalls = [];
+  context.fetch = async (url, options) => {
+    failedCalls.push(options.method);
+    if (url === "/api/uploads") return Response.json({ id: "test-upload", token: "test-upload-token", chunkSize: 512 * 1024 });
+    if (options.method === "DELETE") return Response.json({ deleted: true });
+    return new Response("<html>bad gateway</html>", { status: 502 });
+  };
+  await element("file").onchange({ target: { files: [larger], value: "large.wav" } });
+  assert.deepEqual(failedCalls, ["POST", "PUT", "DELETE"]);
+  assert.equal(element("status").textContent, "语音服务响应超时或暂时不可用，请稍后重试。");
 });

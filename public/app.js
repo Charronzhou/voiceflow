@@ -142,6 +142,52 @@ $("clear").onclick = async () => {
   }
 };
 
+async function requestJson(url, options) {
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(240_000) });
+  if (response.status === 413) throw new Error("上传被服务器限制，请选择更小的录音后重试。");
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error(response.status === 502 || response.status === 504
+      ? "语音服务响应超时或暂时不可用，请稍后重试。"
+      : `服务器返回了无效响应（HTTP ${response.status}），请稍后重试。`);
+  }
+  if (!response.ok) throw new Error(typeof result?.error === "string" ? result.error : "处理失败，请稍后重试。");
+  return result;
+}
+
+async function submitAudio(audio) {
+  if (audio.size <= 512 * 1024) {
+    const form = new FormData();
+    form.append("audio", audio);
+    form.append("names", names);
+    return requestJson("/api/process", { method: "POST", body: form });
+  }
+  const upload = await requestJson("/api/uploads", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: audio.name, size: audio.size, type: audio.type, names }),
+  });
+  if (typeof upload?.id !== "string" || typeof upload.token !== "string" || upload.chunkSize !== 512 * 1024) {
+    throw new Error("服务器返回了无效上传信息，请重试。");
+  }
+  const path = "/api/uploads/" + encodeURIComponent(upload.id);
+  const headers = { "X-Upload-Token": upload.token };
+  try {
+    for (let offset = 0, index = 0; offset < audio.size; offset += upload.chunkSize, index++) {
+      status(`正在上传录音… ${Math.floor(offset / audio.size * 100)}%`, "busy");
+      await requestJson(path + "/" + index, {
+        method: "PUT", headers, body: audio.slice(offset, offset + upload.chunkSize),
+      });
+    }
+    status("正在识别并整理录音…", "busy");
+    return await requestJson(path + "/complete", { method: "POST", headers });
+  } catch (error) {
+    await fetch(path, { method: "DELETE", headers, signal: AbortSignal.timeout(15_000) }).catch(() => {});
+    throw error;
+  }
+}
+
 async function process(audio) {
   if (!audio.size || audio.size > 20 * 1024 * 1024) {
     status(audio.size ? "文件超过 20 MB，请选择较短的录音。" : "这段录音是空的，请重新录制。", "error");
@@ -159,14 +205,9 @@ async function process(audio) {
   $("filename").textContent = audio.name;
   $("selected").hidden = false;
   status("正在识别并整理录音…", "busy");
-  const form = new FormData();
-  form.append("audio", audio);
-  form.append("names", names);
   try {
-    const response = await fetch("/api/process", { method: "POST", body: form, signal: AbortSignal.timeout(240_000) });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "处理失败，请稍后重试。");
-    if (typeof result.original !== "string" || typeof result.raw !== "string") throw new Error("结果格式无效，请重试。");
+    const result = await submitAudio(audio);
+    if (typeof result?.original !== "string" || typeof result?.raw !== "string") throw new Error("结果格式无效，请重试。");
     job = { id: crypto.randomUUID(), original: result.original, raw: result.raw };
     $("output").value = job.original;
     $("raw-text").textContent = job.raw;
